@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>多答后台 · 一键安装</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f7f7f8; --fg:#1a1a1c; --muted:#6b6b73; --card:#fff;
+          --line:#e4e4e8; --accent:#2f6df6; --code:#f2f2f5; --warn:#a8620a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161618; --fg:#eceded; --muted:#9a9aa2; --card:#1e1e21;
+            --line:#2e2e33; --accent:#5b8dff; --code:#232327; --warn:#e0a44a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:20px 16px 60px; background:var(--bg); color:var(--fg);
+         font: 15px/1.65 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
+  .step { background: var(--card); border:1px solid var(--line); border-radius:14px;
+          padding:16px 18px; margin-bottom:16px; }
+  .step h2 { font-size: 16px; margin:0 0 4px; display:flex; align-items:center; gap:8px; }
+  .num { display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px;
+         border-radius:50%; background:var(--accent); color:#fff; font-size:13px; flex:none; }
+  .hint { color: var(--muted); font-size: 13px; margin: 6px 0 12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin: 10px 0; }
+  button, a.btn { font: inherit; font-size:14px; padding:8px 14px; border-radius:9px; cursor:pointer;
+          border:1px solid var(--line); background:var(--card); color:var(--fg); text-decoration:none;
+          display:inline-block; }
+  button.primary, a.btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:active { transform: translateY(1px); }
+  pre { background:var(--code); border:1px solid var(--line); border-radius:10px; padding:12px;
+        overflow:auto; max-height:260px; font-size:12px; line-height:1.5; margin:10px 0 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:pre; }
+  code.inline { background:var(--code); padding:1px 6px; border-radius:5px; font-size:13px;
+        font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .warn { color: var(--warn); }
+  label.field { display:block; margin:10px 0 4px; font-size:13px; color:var(--muted); }
+  input[type=text] { width:100%; padding:9px 11px; border-radius:9px; border:1px solid var(--line);
+        background:var(--card); color:var(--fg); font: inherit; font-size:14px; }
+  ul { margin: 6px 0 0; padding-left: 20px; }
+  li { margin: 3px 0; font-size: 13.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>多答后台 · 一键安装</h1>
+  <div class="sub">把后台迁到你的 Supabase 项目（<code class="inline">wcnssyiqitugqfmcbdhe</code>）。三步，全部在浏览器里完成，不用装任何工具。</div>
+
+  <div class="step">
+    <h2><span class="num">1</span>建表</h2>
+    <div class="hint">打开 SQL Editor，把下面这段全文粘进去，点 <b>Run</b>。脚本是幂等的，重复跑不会报错，也不会动你项目里已有的表。</div>
+    <div class="row">
+      <a class="btn primary" href="https://supabase.com/dashboard/project/wcnssyiqitugqfmcbdhe/sql/new" target="_blank" rel="noopener">打开 SQL Editor</a>
+      <button data-copy="sql">复制 SQL</button>
+    </div>
+    <pre id="sql">-- ============================================================================
+-- 多答后台 · Supabase 建表脚本
+-- ============================================================================
+-- 用法：在你**已有的那个 Supabase 项目**里，打开左侧 SQL Editor → New query
+--       → 全文粘贴 → Run。脚本全部用 IF NOT EXISTS / CREATE OR REPLACE，
+--       重复执行不会报错，也不会删掉你项目里已有的任何表。
+--
+-- 设计要点：
+-- 1. 所有对象都带 duoda_ 前缀，因为这是共享项目，不能占用公共名字。
+-- 2. 三张表全部开启 RLS 并 REVOKE 掉 anon / authenticated 的权限：
+--    数据只能通过 Edge Function（用 service_role 身份）访问。
+--    前端哪怕拿到 anon key 也读不到任何一行，泄不了数据。
+-- 3. 公告版本号「只增不减」写成 SQL 里的 greatest(...)，避免 ETag 不变导致 APP 不刷新。
+-- ============================================================================
+
+-- ── 1. 公告 / 全局开关（单行表，id 恒为 1）────────────────────────────────
+create table if not exists public.duoda_settings (
+  id             int         primary key default 1 check (id = 1),
+  config_version int         not null default 1,
+  kill_switch    boolean     not null default false,
+  announcements  jsonb       not null default '[]'::jsonb,
+  updated_at     timestamptz not null default now()
+);
+
+comment on table  public.duoda_settings is '多答：公告与全局开关，单行表';
+comment on column public.duoda_settings.config_version is '公告版本号，只增不减；APP 用它与 ETag 比对决定是否刷新';
+comment on column public.duoda_settings.announcements is '公告数组，元素形如 {id,priority,max_views,title{lang},body{lang}}';
+
+-- ── 2. 设备表 ──────────────────────────────────────────────────────────────
+create table if not exists public.duoda_devices (
+  device_id    text        primary key,
+  app_version  text        not null default '',
+  version_code int         not null default 0,
+  channel      text        not null default '',
+  brand        text        not null default '',
+  model        text        not null default '',
+  lang         text        not null default '',
+  reports      int         not null default 0,
+  notes        text        not null default '',
+  last_seen_ms bigint      not null default 0,
+  updated_at   timestamptz not null default now()
+);
+
+create index if not exists duoda_devices_last_seen_idx
+  on public.duoda_devices (last_seen_ms desc);
+
+comment on table public.duoda_devices is '多答：上报过用量的设备';
+
+-- ── 3. 遥测配置（单行表）──────────────────────────────────────────────────
+create table if not exists public.duoda_config (
+  id                    int         primary key default 1 check (id = 1),
+  telemetry_enabled     boolean     not null default true,
+  report_interval_hours int         not null default 24,
+  config_ttl_hours      int         not null default 12,
+  updated_at            timestamptz not null default now()
+);
+
+comment on table public.duoda_config is '多答：APP 拉取的遥测/刷新配置，单行表';
+
+-- ── 4. 种子数据 ────────────────────────────────────────────────────────────
+insert into public.duoda_config (id) values (1)
+  on conflict (id) do nothing;
+
+insert into public.duoda_settings (id, config_version, kill_switch, announcements)
+values (
+  1,
+  1,
+  false,
+  jsonb_build_array(
+    jsonb_build_object(
+      'id', 'welcome-160',
+      'priority', 9,
+      'max_views', 0,
+      'title', jsonb_build_object(
+        'zh-CN', '多答 v1.6.0 已就绪',
+        'zh-Hant', '多答 v1.6.0 已就緒',
+        'en', 'Duoda v1.6.0 is ready'
+      ),
+      'body', jsonb_build_object(
+        'zh-CN', '这次更新：1) 新增「截图转坐标定位」技能，截图按原始分辨率无损保存，不压缩、不裁切，图上坐标就是屏幕坐标，点击更准；2) 修好了部分机型输入框压住快捷提示词栏的问题；3) 模型地址填错时不再笼统提示「网络异常」，会直接说明是 DNS、证书、超时还是地址格式问题，并自动修正少了 https://、多了尾斜杠这类写法。',
+        'zh-Hant', '這次更新：1) 新增「截圖轉座標定位」技能，截圖依原始解析度無損儲存，不壓縮、不裁切，圖上座標就是螢幕座標，點擊更準；2) 修好了部分機型輸入框壓住快捷提示詞列的問題；3) 模型位址填錯時不再籠統提示「網路異常」，會直接說明是 DNS、憑證、逾時還是位址格式問題，並自動修正少了 https://、多了尾斜線這類寫法。',
+        'en', 'What''s new: 1) a new screenshot-to-coordinate skill - screenshots are stored losslessly at native resolution, never compressed or cropped, so image coordinates are screen coordinates and taps land accurately; 2) fixed the input box overlapping the quick-prompt bar on some devices; 3) a wrong model endpoint no longer just reports a generic network error - it now names the real cause (DNS, TLS, timeout or bad URL format) and auto-fixes missing https:// or extra trailing slashes.'
+      )
+    )
+  )
+)
+on conflict (id) do nothing;
+
+-- ── 5. 设备写入（原子 upsert，避免 edge function 做读-改-写）──────────────
+create or replace function public.duoda_touch_device(
+  p_id           text,
+  p_version      text    default null,
+  p_version_code int     default null,
+  p_channel      text    default null,
+  p_brand        text    default null,
+  p_model        text    default null,
+  p_lang         text    default null,
+  p_add_report   boolean default false
+) returns void
+language sql
+security definer
+set search_path = public
+as $$
+  insert into public.duoda_devices as d (
+    device_id, app_version, version_code, channel, brand, model, lang,
+    reports, last_seen_ms, updated_at
+  )
+  values (
+    left(coalesce(nullif(p_id, ''), 'anon'), 64),
+    coalesce(p_version, ''),
+    coalesce(p_version_code, 0),
+    coalesce(p_channel, ''),
+    coalesce(p_brand, ''),
+    coalesce(p_model, ''),
+    coalesce(p_lang, ''),
+    case when p_add_report then 1 else 0 end,
+    (extract(epoch from now()) * 1000)::bigint,
+    now()
+  )
+  on conflict (device_id) do update set
+    app_version  = case when coalesce(p_version, '') &lt;&gt; ''      then p_version      else d.app_version  end,
+    version_code = coalesce(nullif(p_version_code, 0), d.version_code),
+    channel      = case when coalesce(p_channel, '') &lt;&gt; ''      then p_channel      else d.channel      end,
+    brand        = case when coalesce(p_brand, '') &lt;&gt; ''        then p_brand        else d.brand        end,
+    model        = case when coalesce(p_model, '') &lt;&gt; ''        then p_model        else d.model        end,
+    lang         = case when coalesce(p_lang, '') &lt;&gt; ''         then p_lang         else d.lang         end,
+    reports      = d.reports + case when p_add_report then 1 else 0 end,
+    last_seen_ms = (extract(epoch from now()) * 1000)::bigint,
+    updated_at   = now();
+$$;
+
+-- ── 6. 发布公告（版本号只增不减）──────────────────────────────────────────
+create or replace function public.duoda_publish_announcements(
+  p_announcements jsonb,
+  p_kill_switch   boolean default false,
+  p_version       int     default 0
+) returns int
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v int;
+begin
+  if p_announcements is null or jsonb_typeof(p_announcements) &lt;&gt; 'array' then
+    raise exception 'announcements_must_be_array';
+  end if;
+
+  update public.duoda_settings
+     set announcements  = p_announcements,
+         kill_switch    = coalesce(p_kill_switch, false),
+         config_version = greatest(coalesce(p_version, 0), config_version + 1),
+         updated_at     = now()
+   where id = 1
+   returning config_version into v;
+
+  if v is null then
+    insert into public.duoda_settings (id, config_version, kill_switch, announcements)
+    values (1, greatest(coalesce(p_version, 0), 1), coalesce(p_kill_switch, false), p_announcements)
+    returning config_version into v;
+  end if;
+
+  return v;
+end;
+$$;
+
+-- ── 7. 锁死权限：只允许 service_role 直接碰表 ─────────────────────────────
+-- 共享项目里这一步很重要：不让 anon key 有任何直接读表的能力。
+-- 注意还要 revoke from public —— 函数默认对 PUBLIC 有 EXECUTE，
+-- 只 revoke anon/authenticated 不足以挡住 PostgREST 的 /rpc/ 调用。
+alter table public.duoda_settings enable row level security;
+alter table public.duoda_devices  enable row level security;
+alter table public.duoda_config   enable row level security;
+
+revoke all on public.duoda_settings from public, anon, authenticated;
+revoke all on public.duoda_devices  from public, anon, authenticated;
+revoke all on public.duoda_config   from public, anon, authenticated;
+
+revoke all on function public.duoda_touch_device(text, text, int, text, text, text, text, boolean)
+  from public, anon, authenticated;
+revoke all on function public.duoda_publish_announcements(jsonb, boolean, int)
+  from public, anon, authenticated;
+
+-- ── 8. 自检：应当返回 3 张表 / 2 个函数 / 3 个 RLS 已开 ──────────────────
+select
+  (select count(*) from information_schema.tables
+     where table_schema = 'public' and table_name like 'duoda\_%') as duoda_tables,
+  (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'public' and p.proname like 'duoda\_%')     as duoda_functions,
+  (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'public' and c.relname like 'duoda\_%' and c.relrowsecurity) as rls_enabled,
+  (select config_version from public.duoda_settings where id = 1)  as config_version;
+</pre>
+    <div class="hint" style="margin-top:12px">跑完底部会出现一行结果，<b>三个数字对上就成功</b>：
+      <code class="inline">3</code> 张表 / <code class="inline">2</code> 个函数 / <code class="inline">3</code> 个 RLS 已开，
+      并显示 <code class="inline">config_version = 1</code>。</div>
+  </div>
+
+  <div class="step">
+    <h2><span class="num">2</span>部署接口函数</h2>
+    <div class="hint">左侧 <b>Edge Functions</b> → <b>Create a new function</b>，名字必须填 <code class="inline">duoda</code>（决定最终地址，别改）。点进代码区，把下面全文覆盖进去，<b>Deploy</b>。</div>
+    <div class="row">
+      <a class="btn primary" href="https://supabase.com/dashboard/project/wcnssyiqitugqfmcbdhe/functions" target="_blank" rel="noopener">打开 Edge Functions</a>
+      <button data-copy="ts">复制函数代码</button>
+    </div>
+    <pre id="ts">// ============================================================================
+// 多答后台 · Supabase Edge Function（单函数路由）
+// ============================================================================
+// 作用：把你现有 Supabase 项目包装成多答 APP 认识的 HTTP 接口，
+//       APP 和后台面板都不需要改代码，只改「后台地址」这一个设置。
+//
+// 部署后地址（填进 APP「设置 — 后台管理」和面板的「后台地址」）：
+//   https://&lt;项目ref&gt;.supabase.co/functions/v1/duoda
+//
+// 已实现的路由（与旧自建 Node 服务完全一致）：
+//   GET    /v1/announcements        APP 拉公告（支持 ETag / 304、顺带登记设备）
+//   GET    /v1/config               APP 拉遥测配置
+//   POST   /v1/usage                APP 上报用量
+//   GET    /v1/devices              设备列表（需 secret）
+//   GET    /v1/admin/state          面板一次拿全量（需 secret）
+//   PUT    /v1/admin/announcements  面板发布公告（需 secret）
+//   DELETE /v1/admin/devices?id=    面板删设备（需 secret）
+//
+// 需要配置的环境变量（Supabase 已自动注入前两个，第三个要你自己加）：
+//   SUPABASE_URL              自动
+//   SUPABASE_SERVICE_ROLE_KEY 自动
+//   PANEL_SECRET              手动：Edge Functions → Secrets
+// ============================================================================
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
+
+const CORS_HEADERS: Record&lt;string, string&gt; = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers":
+    "Content-Type, X-Device-Id, If-None-Match, Authorization, apikey, X-Client-Info, Prefer",
+  "Access-Control-Max-Age": "86400",
+};
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+  { auth: { persistSession: false } },
+);
+
+const FALLBACK_SECRET = "duoda-panel-2026";
+
+function json(body: unknown, status = 200, extra: Record&lt;string, string&gt; = {}): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...CORS_HEADERS,
+      ...extra,
+    },
+  });
+}
+
+/** 取路由尾段：/functions/v1/duoda/v1/announcements → /v1/announcements */
+function routeOf(url: URL): string {
+  const index = url.pathname.indexOf("/duoda");
+  const tail = index &gt;= 0 ? url.pathname.slice(index + "/duoda".length) : url.pathname;
+  return tail.replace(/\/+$/, "") || "/";
+}
+
+function requireSecret(url: URL): Response | null {
+  const expected = Deno.env.get("PANEL_SECRET") ?? FALLBACK_SECRET;
+  if (url.searchParams.get("secret") === expected) return null;
+  return json({ error: "unauthorized", hint: "缺少或错误的 panel secret" }, 401);
+}
+
+/** 设备 ID 兜底：没有 header 也没有参数时，用设备特征算一个稳定匿名 ID。 */
+function anonDeviceId(parts: Array&lt;string | undefined&gt;): string {
+  const source = parts.filter(Boolean).join("|") || "unknown";
+  let hash = 2166136261;
+  for (const ch of source) {
+    hash ^= ch.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return "anon-" + (hash &gt;&gt;&gt; 0).toString(36);
+}
+
+async function readJson(req: Request): Promise&lt;any&gt; {
+  try {
+    const raw = await req.text();
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+type DeviceInfo = {
+  version?: string | null;
+  versionCode?: number | null;
+  channel?: string | null;
+  brand?: string | null;
+  model?: string | null;
+  lang?: string | null;
+};
+
+async function touchDevice(id: string, info: DeviceInfo, addReport: boolean): Promise&lt;void&gt; {
+  const { error } = await supabase.rpc("duoda_touch_device", {
+    p_id: (id ?? "").slice(0, 64),
+    p_version: info.version ?? null,
+    p_version_code: Number(info.versionCode) || null,
+    p_channel: info.channel ?? null,
+    p_brand: info.brand ?? null,
+    p_model: info.model ?? null,
+    p_lang: info.lang ?? null,
+    p_add_report: addReport,
+  });
+  // 设备登记失败不能拖垮公告下发：写日志但继续返回正常结果。
+  if (error) console.error("[duoda] touch device failed:", error.message);
+}
+
+async function loadSettings() {
+  const { data, error } = await supabase
+    .from("duoda_settings")
+    .select("config_version, kill_switch, announcements")
+    .eq("id", 1)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return data ?? { config_version: 1, kill_switch: false, announcements: [] };
+}
+
+async function loadDevices() {
+  const { data, error } = await supabase
+    .from("duoda_devices")
+    .select("*")
+    .order("last_seen_ms", { ascending: false })
+    .limit(500);
+  if (error) throw new Error(error.message);
+  return data ?? [];
+}
+
+async function loadConfig() {
+  const { data, error } = await supabase
+    .from("duoda_config")
+    .select("telemetry_enabled, report_interval_hours, config_ttl_hours")
+    .eq("id", 1)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return data ?? { telemetry_enabled: true, report_interval_hours: 24, config_ttl_hours: 12 };
+}
+
+Deno.serve(async (req: Request): Promise&lt;Response&gt; =&gt; {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
+  const url = new URL(req.url);
+  const route = routeOf(url);
+
+  try {
+    // ── 健康检查 / 根路径 ────────────────────────────────────────────────
+    if (route === "/" || route === "/health") {
+      return json({
+        ok: true,
+        service: "duoda-backend",
+        routes: ["/v1/announcements", "/v1/config", "/v1/usage", "/v1/admin/state"],
+      });
+    }
+
+    // ── APP: 公告 ───────────────────────────────────────────────────────
+    if (route === "/v1/announcements" &amp;&amp; req.method === "GET") {
+      const settings = await loadSettings();
+      const etag = `"a${settings.config_version}"`;
+
+      if (req.headers.get("if-none-match") === etag) {
+        return new Response(null, { status: 304, headers: { ...CORS_HEADERS, ETag: etag } });
+      }
+
+      const device = url.searchParams.get("device") ?? req.headers.get("x-device-id");
+      if (device) {
+        await touchDevice(device, {
+          versionCode: Number(url.searchParams.get("version_code")) || null,
+          channel: url.searchParams.get("channel"),
+          brand: url.searchParams.get("brand"),
+          model: url.searchParams.get("model"),
+          lang: url.searchParams.get("lang"),
+        }, false);
+      }
+
+      return json(settings, 200, { ETag: etag });
+    }
+
+    // ── APP: 遥测配置 ───────────────────────────────────────────────────
+    if (route === "/v1/config" &amp;&amp; req.method === "GET") {
+      const config = await loadConfig();
+      const etag = `"cfg${config.telemetry_enabled ? 1 : 0}${config.report_interval_hours}${config.config_ttl_hours}"`;
+      if (req.headers.get("if-none-match") === etag) {
+        return new Response(null, { status: 304, headers: { ...CORS_HEADERS, ETag: etag } });
+      }
+      return json(config, 200, { ETag: etag });
+    }
+
+    // ── APP: 用量上报 ───────────────────────────────────────────────────
+    if (route === "/v1/usage" &amp;&amp; req.method === "POST") {
+      const body = await readJson(req);
+      const headerId = (req.headers.get("x-device-id") ?? "").slice(0, 64);
+      const id = headerId || anonDeviceId([
+        body?.device?.brand,
+        body?.device?.model,
+        body?.device?.lang,
+        body?.install?.install_day,
+      ]);
+      await touchDevice(id, {
+        versionCode: Number(body?.app?.version_code) || null,
+        channel: body?.app?.current_channel,
+        brand: body?.device?.brand,
+        model: body?.device?.model,
+        lang: body?.device?.lang || body?.app?.app_lang,
+      }, true);
+      return json({ ok: true });
+    }
+
+    // ── 面板: 设备列表 ──────────────────────────────────────────────────
+    if (route === "/v1/devices" &amp;&amp; req.method === "GET") {
+      const denied = requireSecret(url);
+      if (denied) return denied;
+      return json({ devices: await loadDevices() });
+    }
+
+    // ── 面板: 一次拿全量 ────────────────────────────────────────────────
+    if (route === "/v1/admin/state" &amp;&amp; req.method === "GET") {
+      const denied = requireSecret(url);
+      if (denied) return denied;
+      const [settings, devices] = await Promise.all([loadSettings(), loadDevices()]);
+      return json({ announcements: settings, devices });
+    }
+
+    // ── 面板: 发布公告 ──────────────────────────────────────────────────
+    if (route === "/v1/admin/announcements" &amp;&amp; (req.method === "PUT" || req.method === "POST")) {
+      const denied = requireSecret(url);
+      if (denied) return denied;
+
+      const body = await readJson(req);
+      if (!Array.isArray(body?.announcements)) {
+        return json({ error: "announcements_must_be_array" }, 400);
+      }
+
+      const { data, error } = await supabase.rpc("duoda_publish_announcements", {
+        p_announcements: body.announcements,
+        p_kill_switch: !!body.kill_switch,
+        p_version: Number(body.config_version) || 0,
+      });
+      if (error) return json({ error: "publish_failed", message: error.message }, 500);
+
+      return json({
+        ok: true,
+        config_version: data,
+        count: body.announcements.length,
+      });
+    }
+
+    // ── 面板: 删除设备 ──────────────────────────────────────────────────
+    if (route === "/v1/admin/devices" &amp;&amp; req.method === "DELETE") {
+      const denied = requireSecret(url);
+      if (denied) return denied;
+
+      const id = url.searchParams.get("id") ?? "";
+      if (id) {
+        const { error } = await supabase.from("duoda_devices").delete().eq("device_id", id);
+        if (error) return json({ error: "delete_failed", message: error.message }, 500);
+      }
+      return json({ ok: true, devices: await loadDevices() });
+    }
+
+    return json({ error: "not_found", route, method: req.method }, 404);
+  } catch (err) {
+    console.error("[duoda] unhandled:", err);
+    return json({ error: "internal_error", message: String((err as Error)?.message ?? err) }, 500);
+  }
+});
+</pre>
+    <div class="hint" style="margin-top:12px">
+      再回到 <b>Edge Functions → Secrets</b> 加一条：<code class="inline">PANEL_SECRET</code> = 你自己定的密码
+      （<span class="warn">别用默认的 duoda-panel-2026</span>）。<br>
+      <code class="inline">SUPABASE_URL</code> 与 <code class="inline">SUPABASE_SERVICE_ROLE_KEY</code> 平台会自动注入，
+      <b>不要手动加，也不要发给任何人</b>。
+    </div>
+    <div class="hint" style="margin-top:10px">验证：打开
+      <a href="https://wcnssyiqitugqfmcbdhe.supabase.co/functions/v1/duoda/health" target="_blank" rel="noopener">健康检查地址</a>，
+      看到 <code class="inline">"ok":true</code> 就成了。</div>
+  </div>
+
+  <div class="step">
+    <h2><span class="num">3</span>填地址</h2>
+    <div class="hint">APP 的「设置 → 后台管理 → 后台地址」和管理面板的「后台地址」填同一个值：</div>
+    <label class="field">后台地址（点复制）</label>
+    <input type="text" id="baseval" readonly value="https://wcnssyiqitugqfmcbdhe.supabase.co/functions/v1/duoda">
+    <div class="row">
+      <button data-copy="base">复制后台地址</button>
+      <a class="btn" href="index.html">打开管理面板</a>
+    </div>
+    <div class="hint" style="margin-top:10px">面板打开后把上面的地址粘进「后台地址」，密码填第 2 步设的 <code class="inline">PANEL_SECRET</code>，保存即可。</div>
+  </div>
+
+  <div class="step">
+    <h2><span class="num">?</span>出问题看这里</h2>
+    <ul>
+      <li><code class="inline">/health</code> 404 → 函数名不是 <code class="inline">duoda</code>，或没 Deploy 成功</li>
+      <li>面板「请求失败 HTTP 401」→ <code class="inline">PANEL_SECRET</code> 和面板里填的不一致</li>
+      <li>面板「Failed to fetch」→ 函数挂了，去 <b>Edge Functions → Logs</b> 看以 <code class="inline">[duoda]</code> 开头的日志</li>
+      <li>APP 拉不到公告 → 地址漏了 <code class="inline">/functions/v1/duoda</code></li>
+      <li>公告发了 APP 不刷新 → 版本号会自动 +1；仍不刷新就查 <code class="inline">duoda_settings.config_version</code></li>
+      <li>所有请求 500 → <code class="inline">SUPABASE_SERVICE_ROLE_KEY</code> 没注入，重新 Deploy 一次</li>
+    </ul>
+  </div>
+
+  <div class="sub" style="margin-top:8px">本页只含建表语句与接口代码，不含任何密钥。面板密码由你在第 2 步自己设定。</div>
+</div>
+
+<script>
+  function fallbackCopy(text, done) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch (e) { alert('复制失败，请手动长按选择'); }
+    document.body.removeChild(ta);
+  }
+  function copyText(text, btn) {
+    var done = function () {
+      var old = btn.textContent;
+      btn.textContent = '已复制';
+      setTimeout(function () { btn.textContent = old; }, 1400);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text, done); });
+    } else {
+      fallbackCopy(text, done);
+    }
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('button[data-copy]'), function (btn) {
+    btn.addEventListener('click', function () {
+      var key = btn.getAttribute('data-copy');
+      var text = key === 'base'
+        ? document.getElementById('baseval').value
+        : document.getElementById(key).textContent;
+      copyText(text, btn);
+    });
+  });
+</script>
+</body>
+</html>
